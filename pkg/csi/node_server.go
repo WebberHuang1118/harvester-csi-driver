@@ -22,6 +22,7 @@ import (
 	"k8s.io/kubernetes/pkg/volume/util/hostutil"
 	"k8s.io/mount-utils"
 	"k8s.io/utils/exec"
+	kubeexec "k8s.io/utils/exec"
 	kubevirtv1 "kubevirt.io/api/core/v1"
 	"kubevirt.io/client-go/kubecli"
 )
@@ -48,6 +49,7 @@ func NewNodeServer(coreClient ctlv1.Interface, virtClient kubecli.KubevirtClient
 			[]csi.NodeServiceCapability_RPC_Type{
 				csi.NodeServiceCapability_RPC_GET_VOLUME_STATS,
 				csi.NodeServiceCapability_RPC_STAGE_UNSTAGE_VOLUME,
+				csi.NodeServiceCapability_RPC_EXPAND_VOLUME, // added expansion capability
 			}),
 		vip:             vip,
 		harvNetFSClient: harvNetFSClient,
@@ -428,8 +430,86 @@ func (ns *NodeServer) NodeGetVolumeStats(_ context.Context, req *csi.NodeGetVolu
 	}, nil
 }
 
-func (ns *NodeServer) NodeExpandVolume(context.Context, *csi.NodeExpandVolumeRequest) (*csi.NodeExpandVolumeResponse, error) {
-	return nil, status.Error(codes.Unimplemented, "")
+// NodeExpandVolume expands the filesystem on the volume.
+// It is assumed that any underlying block device expansion has been performed
+// by the controller, so this RPC only handles the in-node filesystem resize.
+func (ns *NodeServer) NodeExpandVolume(ctx context.Context, req *csi.NodeExpandVolumeRequest) (*csi.NodeExpandVolumeResponse, error) {
+	volumeID := req.GetVolumeId()
+	volumePath := req.GetVolumePath()
+
+	if volumeID == "" {
+		return nil, status.Error(codes.InvalidArgument, "Volume ID missing in request")
+	}
+	if volumePath == "" {
+		return nil, status.Error(codes.InvalidArgument, "Volume path missing in request")
+	}
+
+	// Check if the volumePath points to a block device (non-directory).
+	fi, err := os.Stat(volumePath)
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "failed to stat volume path %q: %v", volumePath, err)
+	}
+	if !fi.IsDir() {
+		// For block volumes, no filesystem expansion is needed.
+		logrus.Infof("Volume %s at %q is a block device; skipping filesystem expansion", volumeID, volumePath)
+		return &csi.NodeExpandVolumeResponse{
+			CapacityBytes: req.GetCapacityRange().GetRequiredBytes(),
+		}, nil
+	}
+
+	// Verify that the volume is indeed mounted.
+	notMnt, err := isLikelyNotMountPointAttach(volumePath)
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "failed to check mount point for %q: %v", volumePath, err)
+	}
+	if notMnt {
+		return nil, status.Errorf(codes.FailedPrecondition, "volume %s is not mounted at %q", volumeID, volumePath)
+	}
+
+	// For simplicity, assume ext4 as the filesystem type.
+	// You can enhance this by detecting the filesystem type dynamically.
+	fsType := "ext4"
+
+	// Create a mounter instance. This is similar to what you use in NodePublishVolume.
+	mounter := &mount.SafeFormatAndMount{
+		Interface: mount.New(""),
+		Exec:      kubeexec.New(),
+	}
+
+	// Attempt to resize the filesystem.
+	if err := resizeFilesystem(volumePath, fsType, mounter); err != nil {
+		return nil, status.Errorf(codes.Internal, "failed to resize filesystem on volume %s: %v", volumeID, err)
+	}
+
+	newCapacity := req.GetCapacityRange().GetRequiredBytes()
+	logrus.Infof("Successfully expanded volume %s at %q to capacity %d", volumeID, volumePath, newCapacity)
+
+	return &csi.NodeExpandVolumeResponse{
+		CapacityBytes: newCapacity,
+	}, nil
+}
+
+// resizeFilesystem resizes the filesystem at the provided target path.
+// It uses "resize2fs" for ext4 and "xfs_growfs" for XFS.
+// Adjust or extend this function for other filesystem types as needed.
+func resizeFilesystem(targetPath, fsType string, mounter *mount.SafeFormatAndMount) error {
+	switch fsType {
+	case "ext4":
+		// Resize an ext4 filesystem. resize2fs will auto-detect the new size.
+		output, err := mounter.Exec.Command("resize2fs", targetPath).CombinedOutput()
+		if err != nil {
+			return fmt.Errorf("resize2fs failed: %v, output: %s", err, string(output))
+		}
+	case "xfs":
+		// Resize an XFS filesystem.
+		output, err := mounter.Exec.Command("xfs_growfs", targetPath).CombinedOutput()
+		if err != nil {
+			return fmt.Errorf("xfs_growfs failed: %v, output: %s", err, string(output))
+		}
+	default:
+		return fmt.Errorf("unsupported filesystem type: %s", fsType)
+	}
+	return nil
 }
 
 func (ns *NodeServer) NodeGetInfo(context.Context, *csi.NodeGetInfoRequest) (*csi.NodeGetInfoResponse, error) {
