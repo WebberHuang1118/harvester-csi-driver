@@ -438,21 +438,27 @@ func (cs *ControllerServer) ControllerExpandVolume(_ context.Context, req *csi.C
 		)
 	}
 
-	// Check if volume is in use by PVC references in pods' spec
-	// podList, err := cs.coreClient.Pod().List(cs.namespace, metav1.ListOptions{})
-	// if err != nil {
-	// 	return nil, status.Errorf(codes.Internal, "Failed to list pods: %v", err)
-	// }
+	// Check if the PVC is in use by listing pods in the same namespace.
+	// If a pod's volume references this PVC, mark the volume as attached.
+	nodeExpansionRequired := false
+	podList, err := cs.coreClient.Pod().List(cs.namespace, metav1.ListOptions{})
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "Failed to list pods: %v", err)
+	}
 
-	// for _, pod := range podList.Items {
-	// 	for _, vol := range pod.Spec.Volumes {
-	// 		if vol.PersistentVolumeClaim != nil && vol.PersistentVolumeClaim.ClaimName == req.GetVolumeId() {
-	// 			// Volume is in use. Support offline expansion only
-	// 			return nil, status.Errorf(codes.FailedPrecondition, "Volume %s is in use. Online volume expansion is not supported.", req.GetVolumeId())
-	// 		}
-	// 	}
-	// }
+	for _, pod := range podList.Items {
+		for _, vol := range pod.Spec.Volumes {
+			if vol.PersistentVolumeClaim != nil && vol.PersistentVolumeClaim.ClaimName == req.GetVolumeId() {
+				nodeExpansionRequired = true
+				break
+			}
+		}
+		if nodeExpansionRequired {
+			break
+		}
+	}
 
+	// Update the PVC's resource requests with the new capacity.
 	pvc.Spec.Resources = corev1.VolumeResourceRequirements{
 		Requests: corev1.ResourceList{
 			corev1.ResourceStorage: *resource.NewQuantity(req.CapacityRange.GetRequiredBytes(), resource.BinarySI),
@@ -468,11 +474,12 @@ func (cs *ControllerServer) ControllerExpandVolume(_ context.Context, req *csi.C
 	}
 
 	if !cs.waitForPVCState(req.VolumeId, "Expanded", checkPVCExpanded) {
-		return nil, status.Errorf(codes.DeadlineExceeded, "Failed to expand volume %s ", req.GetVolumeId())
+		return nil, status.Errorf(codes.DeadlineExceeded, "Failed to expand volume %s", req.GetVolumeId())
 	}
+
 	return &csi.ControllerExpandVolumeResponse{
 		CapacityBytes:         req.CapacityRange.GetRequiredBytes(),
-		NodeExpansionRequired: false,
+		NodeExpansionRequired: nodeExpansionRequired,
 	}, nil
 }
 

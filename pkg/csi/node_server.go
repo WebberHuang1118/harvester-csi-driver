@@ -434,6 +434,8 @@ func (ns *NodeServer) NodeGetVolumeStats(_ context.Context, req *csi.NodeGetVolu
 // It is assumed that any underlying block device expansion has been performed
 // by the controller, so this RPC only handles the in-node filesystem resize.
 func (ns *NodeServer) NodeExpandVolume(ctx context.Context, req *csi.NodeExpandVolumeRequest) (*csi.NodeExpandVolumeResponse, error) {
+	logrus.Infof("NodeServer NodeExpandVolume req: %v", req)
+
 	volumeID := req.GetVolumeId()
 	volumePath := req.GetVolumePath()
 
@@ -469,6 +471,8 @@ func (ns *NodeServer) NodeExpandVolume(ctx context.Context, req *csi.NodeExpandV
 	// For simplicity, assume ext4 as the filesystem type.
 	// You can enhance this by detecting the filesystem type dynamically.
 	fsType := "ext4"
+	devicePath, err := getDevicePathByVolumeID(req.VolumeId)
+	logrus.Infof("volume %s get device path %s", volumeID, devicePath)
 
 	// Create a mounter instance. This is similar to what you use in NodePublishVolume.
 	mounter := &mount.SafeFormatAndMount{
@@ -477,12 +481,12 @@ func (ns *NodeServer) NodeExpandVolume(ctx context.Context, req *csi.NodeExpandV
 	}
 
 	// Attempt to resize the filesystem.
-	if err := resizeFilesystem(volumePath, fsType, mounter); err != nil {
-		return nil, status.Errorf(codes.Internal, "failed to resize filesystem on volume %s: %v", volumeID, err)
+	if err := resizeFilesystem(devicePath, fsType, mounter); err != nil {
+		return nil, status.Errorf(codes.Internal, "failed to resize fs on volume %s devPath %s: %v", volumeID, devicePath, err)
 	}
 
 	newCapacity := req.GetCapacityRange().GetRequiredBytes()
-	logrus.Infof("Successfully expanded volume %s at %q to capacity %d", volumeID, volumePath, newCapacity)
+	logrus.Infof("Successfully expanded volume %s at %s to capacity %d", volumeID, devicePath, newCapacity)
 
 	return &csi.NodeExpandVolumeResponse{
 		CapacityBytes: newCapacity,
