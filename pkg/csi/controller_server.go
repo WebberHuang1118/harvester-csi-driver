@@ -422,6 +422,13 @@ func (cs *ControllerServer) ControllerModifyVolume(context.Context, *csi.Control
 }
 
 func (cs *ControllerServer) ControllerExpandVolume(_ context.Context, req *csi.ControllerExpandVolumeRequest) (*csi.ControllerExpandVolumeResponse, error) {
+	volCaps := req.GetVolumeCapability()
+	if volCaps == nil {
+		return nil, status.Error(codes.InvalidArgument, "Missing volume capability in request")
+	}
+
+	//volAccessMode := volCaps.GetAccessMode().GetMode()
+
 	pvc, err := cs.coreClient.PersistentVolumeClaim().Get(cs.namespace, req.GetVolumeId(), metav1.GetOptions{})
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "Failed to get PVC %s: %v", req.GetVolumeId(), err)

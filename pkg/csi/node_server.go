@@ -430,11 +430,27 @@ func (ns *NodeServer) NodeGetVolumeStats(_ context.Context, req *csi.NodeGetVolu
 	}, nil
 }
 
+func (ns *NodeServer) nodeExpandRWXVolume(req *csi.NodeExpandVolumeRequest) (*csi.NodeExpandVolumeResponse, error) {
+	return &csi.NodeExpandVolumeResponse{
+		CapacityBytes: req.GetCapacityRange().GetRequiredBytes(),
+	}, nil
+}
+
 // NodeExpandVolume expands the filesystem on the volume.
 // It is assumed that any underlying block device expansion has been performed
 // by the controller, so this RPC only handles the in-node filesystem resize.
 func (ns *NodeServer) NodeExpandVolume(ctx context.Context, req *csi.NodeExpandVolumeRequest) (*csi.NodeExpandVolumeResponse, error) {
 	logrus.Infof("NodeServer NodeExpandVolume req: %v", req)
+
+	volCaps := req.GetVolumeCapability()
+	if volCaps == nil {
+		return nil, status.Error(codes.InvalidArgument, "Missing volume capability in request")
+	}
+
+	volAccessMode := volCaps.GetAccessMode().GetMode()
+	if volAccessMode == csi.VolumeCapability_AccessMode_MULTI_NODE_MULTI_WRITER {
+		return ns.nodeExpandRWXVolume(req)
+	}
 
 	volumeID := req.GetVolumeId()
 	volumePath := req.GetVolumePath()
