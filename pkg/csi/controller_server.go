@@ -628,7 +628,7 @@ func (cs *ControllerServer) generateHostClusterPVCFormat(name string, volCaps []
 			Name:      name,
 		},
 		Spec: corev1.PersistentVolumeClaimSpec{
-			AccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadWriteMany},
+			AccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},
 		},
 	}
 
