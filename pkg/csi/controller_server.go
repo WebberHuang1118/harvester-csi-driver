@@ -120,6 +120,7 @@ func NewControllerServer(
 				csi.ControllerServiceCapability_RPC_PUBLISH_UNPUBLISH_VOLUME,
 				csi.ControllerServiceCapability_RPC_EXPAND_VOLUME,
 				csi.ControllerServiceCapability_RPC_CREATE_DELETE_SNAPSHOT,
+				csi.ControllerServiceCapability_RPC_LIST_SNAPSHOTS,
 			}),
 		accessModes: getVolumeCapabilityAccessModes(accessMode),
 	}
@@ -131,6 +132,10 @@ func (cs *ControllerServer) getHostSnap(ctx context.Context, hostSnap string) (*
 
 func (cs *ControllerServer) createHostSnap(ctx context.Context, hostSnap *snapshotv1.VolumeSnapshot) (*snapshotv1.VolumeSnapshot, error) {
 	return cs.snapClient.SnapshotV1().VolumeSnapshots(cs.namespace).Create(ctx, hostSnap, metav1.CreateOptions{})
+}
+
+func (cs *ControllerServer) listHostSnaps(ctx context.Context, lo metav1.ListOptions) (*snapshotv1.VolumeSnapshotList, error) {
+	return cs.snapClient.SnapshotV1().VolumeSnapshots(cs.namespace).List(ctx, lo)
 }
 
 func (cs *ControllerServer) deleteHostSnap(ctx context.Context, hostSnap *snapshotv1.VolumeSnapshot) error {
@@ -946,9 +951,124 @@ func (cs *ControllerServer) DeleteSnapshot(ctx context.Context, req *csi.DeleteS
 	return &csi.DeleteSnapshotResponse{}, nil
 }
 
+// validateListSnapshotsRequest validates the ListSnapshotsRequest and prepares list options
+func validateListSnapshotsRequest(req *csi.ListSnapshotsRequest) (metav1.ListOptions, error) {
+	// Validate request parameters
+	if req.MaxEntries < 0 {
+		return metav1.ListOptions{}, status.Error(codes.InvalidArgument, "MaxEntries cannot be negative")
+	}
+
+	// Prepare list options
+	listOptions := metav1.ListOptions{}
+
+	// Handle pagination
+	if req.StartingToken != "" {
+		listOptions.Continue = req.StartingToken
+	}
+
+	// Set limit if MaxEntries is specified
+	if req.MaxEntries > 0 {
+		listOptions.Limit = int64(req.MaxEntries)
+	}
+
+	return listOptions, nil
+}
+
+// shouldIncludeSnapshot determines if a snapshot should be included based on request filters
+func (cs *ControllerServer) shouldIncludeSnapshot(hostSnap *snapshotv1.VolumeSnapshot, req *csi.ListSnapshotsRequest) bool {
+	// Skip snapshots that don't have the required labels (not created by this driver)
+	if err := cs.validateHostSnapLabels(hostSnap); err != nil {
+		logrus.Debugf("Skipping snapshot %s: %v", hostSnap.Name, err)
+		return false
+	}
+
+	// Filter by snapshot ID if requested
+	if req.SnapshotId != "" && hostSnap.Name != req.SnapshotId {
+		return false
+	}
+
+	// Filter by source volume ID if requested
+	if req.SourceVolumeId != "" {
+		// Get the source PVC name from the snapshot spec
+		if hostSnap.Spec.Source.PersistentVolumeClaimName == nil ||
+			*hostSnap.Spec.Source.PersistentVolumeClaimName != req.SourceVolumeId {
+			return false
+		}
+	}
+
+	return true
+}
+
+// convertHostSnapshotToEntry converts a host snapshot to a CSI ListSnapshotsResponse_Entry
+func (cs *ControllerServer) convertHostSnapshotToEntry(hostSnap *snapshotv1.VolumeSnapshot) (*csi.ListSnapshotsResponse_Entry, error) {
+	// Get source volume ID from snapshot spec
+	vol := ""
+	if hostSnap.Spec.Source.PersistentVolumeClaimName != nil {
+		vol = *hostSnap.Spec.Source.PersistentVolumeClaimName
+	}
+
+	// Convert to CSI snapshot
+	csiSnapshot, err := cs.convertVolumeSnapshotToCSI(hostSnap, vol)
+	if err != nil {
+		return nil, fmt.Errorf("failed to convert snapshot %s to CSI format: %w", hostSnap.Name, err)
+	}
+
+	return &csi.ListSnapshotsResponse_Entry{
+		Snapshot: csiSnapshot,
+	}, nil
+}
+
+// processHostSnapshots converts host snapshots to CSI snapshots with filtering
+func (cs *ControllerServer) processHostSnapshots(hostSnaps *snapshotv1.VolumeSnapshotList, req *csi.ListSnapshotsRequest) []*csi.ListSnapshotsResponse_Entry {
+	var csiSnapshots []*csi.ListSnapshotsResponse_Entry
+
+	for _, hostSnap := range hostSnaps.Items {
+		if !cs.shouldIncludeSnapshot(&hostSnap, req) {
+			continue
+		}
+
+		entry, err := cs.convertHostSnapshotToEntry(&hostSnap)
+		if err != nil {
+			logrus.Warnf("Failed to convert snapshot %s: %v", hostSnap.Name, err)
+			continue
+		}
+
+		csiSnapshots = append(csiSnapshots, entry)
+	}
+
+	return csiSnapshots
+}
+
 func (cs *ControllerServer) ListSnapshots(ctx context.Context, req *csi.ListSnapshotsRequest) (*csi.ListSnapshotsResponse, error) {
-	logrus.Infof("ListSnapshots called: stub implementation")
-	return nil, status.Error(codes.Unimplemented, "ListSnapshots is not implemented yet")
+	logrus.Infof("ListSnapshots req: %v", req)
+
+	// Validate request and prepare list options
+	listOptions, err := validateListSnapshotsRequest(req)
+	if err != nil {
+		return nil, err
+	}
+
+	// List all volume snapshots in the namespace
+	hostSnaps, err := cs.listHostSnaps(ctx, listOptions)
+	if err != nil {
+		return nil, err
+	}
+
+	// Convert and filter snapshots
+	csiSnapshots := cs.processHostSnapshots(hostSnaps, req)
+
+	// Prepare response
+	response := &csi.ListSnapshotsResponse{
+		Entries: csiSnapshots,
+	}
+
+	// Set next token for pagination if there are more results
+	if hostSnaps.Continue != "" {
+		response.NextToken = hostSnaps.Continue
+	}
+
+	logrus.Infof("ListSnapshots returning %d snapshots", len(csiSnapshots))
+	return response, nil
 }
 
 func (cs *ControllerServer) ControllerModifyVolume(context.Context, *csi.ControllerModifyVolumeRequest) (*csi.ControllerModifyVolumeResponse, error) {
