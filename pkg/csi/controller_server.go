@@ -183,7 +183,7 @@ func (cs *ControllerServer) validStorageClass(storageClassName string) (*storage
 	return sc, nil
 }
 
-func (cs *ControllerServer) validateVolumeContentSource(ctx context.Context, vcs *csi.VolumeContentSource) error {
+func (cs *ControllerServer) validateVolumeContentSource(vcs *csi.VolumeContentSource, vc []*csi.VolumeCapability) error {
 	if vcs == nil {
 		return nil
 	}
@@ -201,10 +201,17 @@ func (cs *ControllerServer) validateVolumeContentSource(ctx context.Context, vcs
 		return status.Error(codes.InvalidArgument, "Snapshot source is specified but SnapshotId is empty")
 	}
 
+	// Check if the volume has RWX access mode and prevent snapshot-based volume creation
+	for _, v := range vc {
+		if v.GetAccessMode().GetMode() == csi.VolumeCapability_AccessMode_MULTI_NODE_MULTI_WRITER {
+			return status.Error(codes.InvalidArgument, "Creating RWX volumes from snapshots is not supported")
+		}
+	}
+
 	return nil
 }
 
-func (cs *ControllerServer) validateCreateVolReq(ctx context.Context, req *csi.CreateVolumeRequest) (map[string]string, int64, error) {
+func (cs *ControllerServer) validateCreateVolReq(req *csi.CreateVolumeRequest) (map[string]string, int64, error) {
 	if err := cs.validateControllerServiceRequest(csi.ControllerServiceCapability_RPC_CREATE_DELETE_VOLUME); err != nil {
 		return nil, 0, status.Errorf(codes.InvalidArgument, "invalid create volume req: %v", err)
 	}
@@ -218,7 +225,7 @@ func (cs *ControllerServer) validateCreateVolReq(ctx context.Context, req *csi.C
 	}
 
 	// Validate VolumeContentSource
-	if err := cs.validateVolumeContentSource(ctx, req.GetVolumeContentSource()); err != nil {
+	if err := cs.validateVolumeContentSource(req.GetVolumeContentSource(), req.GetVolumeCapabilities()); err != nil {
 		return nil, 0, err
 	}
 
@@ -324,7 +331,7 @@ func (cs *ControllerServer) CreateVolume(ctx context.Context, req *csi.CreateVol
 	logrus.Infof("ControllerServer create volume req: %v", req)
 
 	// Validate request and get processed parameters
-	volumeParameters, volSizeBytes, err := cs.validateCreateVolReq(ctx, req)
+	volumeParameters, volSizeBytes, err := cs.validateCreateVolReq(req)
 	if err != nil {
 		return nil, err
 	}
@@ -1417,9 +1424,15 @@ func isLHRWXVolume(pvc *corev1.PersistentVolumeClaim) bool {
 		return false
 	}
 	for _, mode := range pvc.Spec.AccessModes {
-		if mode == corev1.ReadWriteMany {
+		if mode != corev1.ReadWriteMany {
+			continue
+		}
+
+		// Check if the provisioner is Longhorn
+		if provisioner := pvc.Annotations[utils.AnnStorageProvisioner]; provisioner == longhornProvisioner {
 			return true
 		}
+
 	}
 	return false
 }
