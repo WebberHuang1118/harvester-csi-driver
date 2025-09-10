@@ -1012,7 +1012,7 @@ func (cs *ControllerServer) convertHostSnapshotToEntry(hostSnap *snapshotv1.Volu
 
 // processHostSnapshots converts host snapshots to CSI snapshots with filtering
 func (cs *ControllerServer) processHostSnapshots(hostSnaps *snapshotv1.VolumeSnapshotList, req *csi.ListSnapshotsRequest) []*csi.ListSnapshotsResponse_Entry {
-	var csiSnapshots []*csi.ListSnapshotsResponse_Entry
+	csiSnapshots := make([]*csi.ListSnapshotsResponse_Entry, 0, len(hostSnaps.Items))
 
 	for _, hostSnap := range hostSnaps.Items {
 		if !cs.shouldIncludeSnapshot(&hostSnap, req) {
