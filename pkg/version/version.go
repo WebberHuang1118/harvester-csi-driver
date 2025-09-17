@@ -3,7 +3,7 @@ package version
 import "fmt"
 
 var (
-	Version   = "v0.0.0-dev"
+	Version   = "v0.2.4"
 	GitCommit = "HEAD"
 )
 
