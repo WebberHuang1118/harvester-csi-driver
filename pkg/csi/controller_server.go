@@ -58,6 +58,7 @@ type ControllerServer struct {
 	pods ctlv1.PodCache
 
 	// local clients
+	localKubeClient *kubernetes.Clientset
 	localCoreClient ctlv1.Interface
 
 	// these clients are used to access the host cluster resources
@@ -76,6 +77,7 @@ type ControllerServer struct {
 }
 
 func NewControllerServer(
+	localKubeClient *kubernetes.Clientset,
 	localCoreClient ctlv1.Interface,
 	coreClient ctlv1.Interface,
 	storageClient ctlstoragev1.Interface,
@@ -104,6 +106,7 @@ func NewControllerServer(
 	return &ControllerServer{
 		namespace:        namespace,
 		hostStorageClass: hostStorageClass,
+		localKubeClient:  localKubeClient,
 		localCoreClient:  localCoreClient,
 		coreClient:       coreClient,
 		storageClient:    storageClient,
@@ -550,7 +553,19 @@ func (cs *ControllerServer) waitForVASettled(pvc *corev1.PersistentVolumeClaim, 
 	volumeID := pvc.Spec.VolumeName
 	for _, va := range hostVAs.Items {
 		if *va.Spec.Source.PersistentVolumeName == volumeID && va.Spec.NodeName != targetHostNodeID {
-			logrus.Warnf("Block Volume %s is already attached to node %s, cannot attach to node %s", volumeID, va.Spec.NodeName, nodeID)
+			logrus.Warnf("Block Volume %s is already attached to host node %s, cannot attach to node %s", volumeID, va.Spec.NodeName, targetHostNodeID)
+			return false, nil
+		}
+	}
+
+	// final check the guest cluster VAs, we should ensure there is only one attachment on the guest cluster side with RWO volume.
+	guestVA, err := cs.localKubeClient.StorageV1().VolumeAttachments().List(context.TODO(), metav1.ListOptions{})
+	if err != nil {
+		return false, status.Errorf(codes.Internal, "Failed to list guest VolumeAttachments: %v", err)
+	}
+	for _, va := range guestVA.Items {
+		if va.Status.Attached && *va.Spec.Source.PersistentVolumeName == volumeID && va.Spec.NodeName != nodeID {
+			logrus.Warnf("Block Volume %s is already attached to guest node %s, cannot attach to node %s", volumeID, va.Spec.NodeName, nodeID)
 			return false, nil
 		}
 	}
