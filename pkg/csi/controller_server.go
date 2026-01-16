@@ -525,47 +525,90 @@ func (cs *ControllerServer) ControllerPublishVolume(_ context.Context, req *csi.
 
 // waitForVaSettled used to ensure the host VA is cleaned up before we attach the volume on the guest cluster.
 func (cs *ControllerServer) waitForVASettled(pvc *corev1.PersistentVolumeClaim, nodeID string) (bool, error) {
-	skipCheckHostVA := false
+	// Check if volume is in use by other VM
+	if cs.isVolumeUsedByOtherVM(pvc, nodeID) {
+		return false, nil
+	}
+
+	// Try to get host volume attachments
+	hostVAs, skipCheckHostVA := cs.getHostVolumeAttachments()
+
+	// Early exit for filesystem volumes when we can skip VA checking
+	if cs.canSkipVACheck(skipCheckHostVA, pvc.Spec.VolumeMode) {
+		return true, nil
+	}
+
+	// Get target host node ID from VMI
+	targetHostNodeID, err := cs.getTargetHostNodeID(nodeID)
+	if err != nil {
+		return false, err
+	}
+
+	// Check for conflicting host volume attachments
+	volumeID := pvc.Spec.VolumeName
+	if cs.isVolumeAttachedToOtherHostNode(hostVAs, volumeID, targetHostNodeID) {
+		return false, nil
+	}
+
+	// Check for conflicting guest volume attachments
+	return cs.hasConflictingGuestVolumeAttachments(volumeID, nodeID)
+}
+
+// getHostVolumeAttachments retrieves host volume attachments and returns whether to skip checking
+func (cs *ControllerServer) getHostVolumeAttachments() (*storagev1.VolumeAttachmentList, bool) {
 	hostVAs, err := cs.kubeClient.StorageV1().VolumeAttachments().List(context.TODO(), metav1.ListOptions{})
 	if err != nil {
-		// ignore error here becaseu we might have permission issue ono old Harvester cluster
+		// ignore error here because we might have permission issue on old Harvester cluster
 		logrus.Warnf("Failed to list VolumeAttachments: %v, Skip VA checking because the host might be the old version.", err)
-		skipCheckHostVA = true
+		return nil, true
 	}
-	volumeMode := pvc.Spec.VolumeMode
-	if !cs.checkVolumeInUseByVM(pvc) {
-		if skipCheckHostVA || volumeMode == nil || *volumeMode == corev1.PersistentVolumeFilesystem {
-			return true, nil
-		}
-	} else {
-		logrus.Infof("Volume %s is already attached to node", pvc.Spec.VolumeName)
-	}
+	return hostVAs, false
+}
 
-	// get corresponding nodeID of the VM
+// canSkipVACheck determines if we can skip volume attachment checking
+func (cs *ControllerServer) canSkipVACheck(skipCheckHostVA bool, volumeMode *corev1.PersistentVolumeMode) bool {
+	if !skipCheckHostVA {
+		return false
+	}
+	return volumeMode == nil || *volumeMode == corev1.PersistentVolumeFilesystem
+}
+
+// getTargetHostNodeID retrieves the host node ID where the VMI is running
+func (cs *ControllerServer) getTargetHostNodeID(nodeID string) (string, error) {
 	vmi, err := cs.virtClient.VirtualMachineInstance(cs.namespace).Get(context.TODO(), nodeID, metav1.GetOptions{})
 	if err != nil {
-		return false, status.Errorf(codes.Internal, "Failed to get VMI %s: %v", nodeID, err)
+		return "", status.Errorf(codes.Internal, "Failed to get VMI %s: %v", nodeID, err)
 	}
-	targetHostNodeID := vmi.Status.NodeName
+	return vmi.Status.NodeName, nil
+}
 
-	// for block volume, we need to check the volumeattachments
-	// and ensure there is no any volumeattachment on the host side.
-	volumeID := pvc.Spec.VolumeName
+// isVolumeAttachedToOtherHostNode checks if the volume is attached to a different host node
+func (cs *ControllerServer) isVolumeAttachedToOtherHostNode(hostVAs *storagev1.VolumeAttachmentList, volumeID, targetHostNodeID string) bool {
+	if hostVAs == nil {
+		return false
+	}
+
 	for _, va := range hostVAs.Items {
 		if *va.Spec.Source.PersistentVolumeName == volumeID && va.Spec.NodeName != targetHostNodeID {
-			logrus.Warnf("Block Volume %s is already attached to host node %s, cannot attach to node %s", volumeID, va.Spec.NodeName, targetHostNodeID)
-			return false, nil
+			logrus.Warnf("Block Volume %s is already attached to host node %s, cannot attach to node %s",
+				volumeID, va.Spec.NodeName, targetHostNodeID)
+			return true
 		}
 	}
+	return false
+}
 
-	// final check the guest cluster VAs, we should ensure there is only one attachment on the guest cluster side with RWO volume.
-	guestVA, err := cs.localKubeClient.StorageV1().VolumeAttachments().List(context.TODO(), metav1.ListOptions{})
+// hasConflictingGuestVolumeAttachments checks if there are conflicting guest volume attachments
+func (cs *ControllerServer) hasConflictingGuestVolumeAttachments(volumeID, nodeID string) (bool, error) {
+	guestVAs, err := cs.localKubeClient.StorageV1().VolumeAttachments().List(context.TODO(), metav1.ListOptions{})
 	if err != nil {
 		return false, status.Errorf(codes.Internal, "Failed to list guest VolumeAttachments: %v", err)
 	}
-	for _, va := range guestVA.Items {
+
+	for _, va := range guestVAs.Items {
 		if va.Status.Attached && *va.Spec.Source.PersistentVolumeName == volumeID && va.Spec.NodeName != nodeID {
-			logrus.Warnf("Block Volume %s is already attached to guest node %s, cannot attach to node %s", volumeID, va.Spec.NodeName, nodeID)
+			logrus.Warnf("Block Volume %s is already attached to guest node %s, cannot attach to node %s",
+				volumeID, va.Spec.NodeName, nodeID)
 			return false, nil
 		}
 	}
@@ -573,22 +616,57 @@ func (cs *ControllerServer) waitForVASettled(pvc *corev1.PersistentVolumeClaim, 
 	return true, nil
 }
 
-func (cs *ControllerServer) checkVolumeInUseByVM(pvc *corev1.PersistentVolumeClaim) bool {
-	vmiList, err := cs.virtClient.VirtualMachineInstance(cs.namespace).List(context.TODO(), metav1.ListOptions{})
+func (cs *ControllerServer) isVolumeUsedByOtherVM(pvc *corev1.PersistentVolumeClaim, current string) bool {
+	vmList, err := cs.virtClient.VirtualMachine(cs.namespace).List(context.TODO(), metav1.ListOptions{})
 	if err != nil {
-		// if we cannot list the VMI, we can assume the volume is in use, controller will retry later.
-		logrus.Errorf("Failed to list VMI: %v", err)
+		// if we cannot list the VM, we can assume the volume is in use, controller will retry later.
+		logrus.Errorf("Failed to list VM: %v", err)
 		return true
 	}
 
-	for _, vmi := range vmiList.Items {
-		for _, volStatus := range vmi.Status.VolumeStatus {
-			if volStatus.Name == pvc.Name && volStatus.HotplugVolume != nil {
-				logrus.Infof("Volume %s is in use by VMI %s", pvc.Spec.VolumeName, vmi.Name)
-				return true
-			}
+	for _, vm := range vmList.Items {
+		if vm.Name == current {
+			continue
+		}
+
+		if cs.isVolUsedByVM(&vm, pvc.Name) {
+			logrus.Infof("Volume %s is used by VM %s, not by the current node %s", pvc.Name, vm.Name, current)
+			return true
 		}
 	}
+
+	return false
+}
+
+// vmUsesVolume checks if a specific VM references the volume
+func (cs *ControllerServer) isVolUsedByVM(vm *kubevirtv1.VirtualMachine, pvcName string) bool {
+	if vm.Spec.Template == nil {
+		return false
+	}
+
+	for _, volume := range vm.Spec.Template.Spec.Volumes {
+		if !cs.volumeMatchesPVC(&volume, pvcName) {
+			continue
+		}
+
+		return true
+	}
+
+	return false
+}
+
+// volumeMatchesPVC checks if a volume matches the given PVC
+func (cs *ControllerServer) volumeMatchesPVC(volume *kubevirtv1.Volume, pvcName string) bool {
+	// Check if the volume references this PVC
+	if volume.PersistentVolumeClaim != nil && volume.PersistentVolumeClaim.ClaimName == pvcName {
+		return true
+	}
+
+	// Also check DataVolume references
+	if volume.DataVolume != nil && volume.DataVolume.Name == pvcName {
+		return true
+	}
+
 	return false
 }
 
